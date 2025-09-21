@@ -19,4 +19,18 @@ where = ["."]
 include = ["apple_batch_invariant_ops*"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "numpy",
+]
+integration = [
+    "requests",
+]
+bench = [
+    "numpy",
+]
+full = [
+    "pytest",
+    "numpy",
+    "requests",
+]

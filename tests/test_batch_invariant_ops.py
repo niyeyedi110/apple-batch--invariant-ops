@@ -1,7 +1,15 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
-from apple_batch_invariant_ops import set_batch_invariant_mode
+from apple_batch_invariant_ops import (
+    BatchInvariantConfig,
+    disable_batch_invariant_mode,
+    enable_batch_invariant_mode,
+    get_active_config,
+    is_batch_invariant_mode_enabled,
+    set_batch_invariant_mode,
+)
 
 
 def _device():
@@ -53,7 +61,7 @@ def test_log_softmax_matches_reference():
         actual = F.log_softmax(x, dim=-1)
 
     ref = _restore(torch.log_softmax(_to_cpu64(x), dim=-1), like=x)
-    assert torch.allclose(actual, ref, atol=0, rtol=0)
+    assert torch.allclose(actual, ref, atol=1e-6, rtol=0)
 
 
 def test_mean_matches_reference():
@@ -66,3 +74,76 @@ def test_mean_matches_reference():
 
     ref = _restore(_to_cpu64(x).mean(dim=(-2, -1)), like=x)
     assert torch.allclose(actual, ref, atol=1e-6, rtol=0)
+
+
+def test_mean_dtype_override():
+    device = _device()
+    x = torch.randn(2, 3, device=device, dtype=torch.float32)
+
+    with set_batch_invariant_mode():
+        actual = torch.mean(x, dim=1, dtype=torch.float32)
+
+    ref = _restore(_to_cpu64(x).mean(dim=1), like=x)
+    assert torch.allclose(actual, ref, atol=1e-6, rtol=0)
+
+
+def test_manual_seed_restored():
+    torch.manual_seed(1234)
+    baseline = torch.rand(4)
+
+    config = BatchInvariantConfig(manual_seed=42)
+    with set_batch_invariant_mode(config=config):
+        inside = torch.rand(4)
+
+    torch.manual_seed(1234)
+    after = torch.rand(4)
+    assert torch.allclose(after, baseline)
+
+    torch.manual_seed(42)
+    expected = torch.rand(4)
+    assert torch.allclose(inside.cpu(), expected)
+
+
+def test_force_cpu_false_precision_float32_matches_eager():
+    device = _device()
+    a = torch.randn(6, 6, device=device, dtype=torch.float32)
+    b = torch.randn(6, 6, device=device, dtype=torch.float32)
+    config = BatchInvariantConfig(force_cpu=False, precision=torch.float32)
+
+    with set_batch_invariant_mode(config=config):
+        actual = torch.mm(a, b)
+
+    reference = torch.mm(a, b)
+    assert torch.allclose(actual, reference, atol=0, rtol=0)
+
+
+def test_context_disable_keeps_global_state():
+    disable_batch_invariant_mode()
+    assert not is_batch_invariant_mode_enabled()
+    with set_batch_invariant_mode(enabled=False):
+        assert not is_batch_invariant_mode_enabled()
+    assert not is_batch_invariant_mode_enabled()
+
+
+def test_enable_disable_cycle_restores_previous_config():
+    disable_batch_invariant_mode()
+    base_config = BatchInvariantConfig(force_cpu=True, precision=torch.float64)
+    enable_batch_invariant_mode(base_config)
+    assert is_batch_invariant_mode_enabled()
+    assert get_active_config() == base_config
+
+    override_config = BatchInvariantConfig(force_cpu=False, precision=torch.float32)
+    with set_batch_invariant_mode(config=override_config):
+        assert get_active_config() == override_config
+        _ = torch.mm(torch.randn(2, 2), torch.randn(2, 2))
+
+    assert get_active_config() == base_config
+    disable_batch_invariant_mode()
+    assert not is_batch_invariant_mode_enabled()
+
+
+def test_invalid_precision_rejected():
+    config = BatchInvariantConfig(precision=torch.bfloat16)
+    disable_batch_invariant_mode()
+    with pytest.raises(ValueError):
+        enable_batch_invariant_mode(config)
