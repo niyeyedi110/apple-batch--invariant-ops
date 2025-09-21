@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batch-invariant-ops-apple"
+version = "0.1.0"
+description = "Batch-invariant PyTorch ops tailored for Apple Silicon (CPU/MPS backends)."
+requires-python = ">=3.9"
+authors = [
+    {name = "Codex"}
+]
+dependencies = [
+    "torch>=2.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apple_batch_invariant_ops*"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
