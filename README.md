@@ -1,18 +1,11 @@
 # Batch Invariant Ops (Apple Silicon Edition)
 
-本项目复现并改写了 [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) 中的核心思想，针对 Apple Silicon (M 系列) 环境给出无 CUDA、无 Triton 依赖的批次不变算子实现。所有算子均通过将计算转移到 CPU 上的高精度 (float64) 运算来保持运算顺序的确定性，并在执行结束后自动还原到原始设备/精度，因此可以无缝与 MPS 后端的推理代码协同使用。
+面向 Apple Silicon (M 系列) 的批次不变 PyTorch 扩展。灵感来自 [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)，在无 CUDA/Triton 的条件下重现论文提出的确定性推理思路，并针对 MPS/CPU 场景完成工程化改造。
 
-## 背景概述
-
-原论文指出：在 GPU 上进行矩阵乘、归一化等操作时，线程分块策略会随批次大小改变，导致数值舍入顺序发生变化，进而产生看似“随机”的推理结果。论文方案通过定制 Triton kernel 强制固定分块顺序以保证批次不变性。
-
-在 Apple Silicon 环境中暂无法使用 Triton/CUDA，因此这里采用以下策略实现同样的目标：
-
-1. **算子劫持**：利用 `torch.library` 在运行时注册 Apple 端算子实现，取代 PyTorch 默认的 `aten::mm`/`aten::addmm`/`aten::_log_softmax`/`aten::mean.dim`。
-2. **高精度 CPU 计算**：在劫持后的算子内部，将输入张量复制到 CPU，转换为 `float64`，执行确定性的 CPU 运算，再转换回原始设备与数据类型。
-3. **面向推理**：方案专注推理工作负载（无梯度需求），适合需要在 MPS/CPU 上稳定复现 LLM 推理结果的场景。
-
-虽然这种方法较原始 GPU 持久化 kernel 更慢，但在 Apple 芯片上可立即使用，同时可作为日后官方 Apple GPU 支持到来前的过渡解。
+- **算子级劫持**：运行时用 `torch.library` 改写 `aten::mm`、`aten::addmm`、`aten::_log_softmax`、`aten::mean.dim`。
+- **可配置精度**：默认 CPU `float64` 保证稳定舍入，也可选择 `float32` 或保留原设备。
+- **运行时防护**：支持强制启用 PyTorch 确定性算法、固定随机种子并自动恢复。
+- **MPS 友好**：自动避开 MPS 对 `float64` 的限制，可直接用于 LM Studio 等 Apple GPU 推理流程。
 
 ## 安装
 
@@ -20,48 +13,112 @@
 python -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -e .
+pip install -e .          # 核心功能
+pip install -e .[dev]     # 开发 + 测试（pytest、numpy）
+pip install -e .[integration]  # LM Studio 集成示例需要 requests
 ```
 
-要求 `torch>=2.2` 且运行于 macOS arm64。
+依赖 `torch>=2.2`，推荐在 macOS 14+/Apple M 系列机器上使用。
 
-## 快速开始
+## 快速上手
 
 ```python
 import torch
 from apple_batch_invariant_ops import set_batch_invariant_mode
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-B, D = 128, 512
-a = torch.linspace(-50, 50, B * D, device=device).reshape(B, D)
-b = torch.linspace(-10, 10, D * D, device=device).reshape(D, D)
+a = torch.randn(128, 512, device=device)
+b = torch.randn(512, 512, device=device)
 
 with set_batch_invariant_mode():
-    # 批次=1 与 批次=全部 得到完全一致的数值
     out_single = torch.mm(a[:1], b)
-    out_batch = torch.mm(a, b)[:1]
-    diff = (out_single - out_batch).abs().max()
-    print("difference", diff.item())  # 始终为 0
+    out_full = torch.mm(a, b)[:1]
+
+print("max diff", (out_single - out_full).abs().max().item())  # -> 0.0
 ```
 
-`set_batch_invariant_mode()` 会在进入上下文时劫持算子，退出时还原。
+### 高级配置
 
-## 运行测试
+```python
+from apple_batch_invariant_ops import BatchInvariantConfig, set_batch_invariant_mode
+
+config = BatchInvariantConfig(
+    precision=torch.float32,
+    force_cpu=False,
+    enforce_deterministic_algorithms=True,
+    manual_seed=42,
+)
+
+with set_batch_invariant_mode(config=config):
+    logits = torch.log_softmax(x, dim=-1)
+```
+
+## 实验结果（M4 Pro, macOS 15, PyTorch 2.8）
+
+```
+Batch-invariant benchmark on mps
+op          shape               eager diff          det diff        eager ms            det ms
+----------------------------------------------------------------------------------------------
+mm          (32, 256, 256)        1.53e-05          0.00e+00           39.18              3.79
+mm          (64, 512, 512)        3.43e-05          0.00e+00            1.29              1.03
+mm          (128, 768, 768)       7.63e-05          0.00e+00           18.32              2.21
+log_softmax (32, 512)             0.00e+00          0.00e+00          184.54              1.03
+log_softmax (64, 1024)            0.00e+00          0.00e+00            1.95              1.04
+mean        (16, 64, 128)         2.79e-09          0.00e+00           92.06              1.73
+mean        (32, 64, 256)         3.49e-09          0.00e+00           49.72              1.90
+```
+
+- `eager diff`：原生算子在“单样本切片 vs 整批”两条路径下的最大误差。
+- `det diff`：启用批次不变模式后误差降到 0。
+- `det ms`：批次不变模式耗时，部分算子回落到 CPU `float64`，吞吐低于 MPS，但换来完全可复现的结果。
+
+更多实验（随机种子敏感性、控制变量对比等）见 [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)。
+
+## LM Studio 集成示例
+
+`examples/lm_studio_client.py` 演示如何在调用本地 LM Studio OpenAI 接口后，使用批次不变算子处理嵌入向量，消除批量差异。
+
+```bash
+export LM_STUDIO_URL=http://192.168.0.100:1234
+export LM_STUDIO_MODEL=qwen3-30b-a3b-thinking-2507-mlx
+python -m venv venv
+source venv/bin/activate
+pip install -e .[integration]
+python examples/lm_studio_client.py
+```
+
+输出将比对“单行 vs 整批”的最大差异，批次不变模式下预期为 `0.00e+00`。
+
+### 文本生成的确定性
+
+- **采样策略是首要因素。** 在 LM Studio/OpenAI 接口中，将 `temperature=0.0`、禁用 `top_p`、固定 `seed` 后，可以获得逐字符一致的回复。
+- **批次不变算子提供底层保障。** 数值实验显示矩阵运算的批次差异被抹平；配合确定性采样，可实现端到端可复现的文本生成。
+- **控制变量实验结论：**
+  - 仅使用确定性采样 → 文本一致；
+  - 仅使用批次不变算子 → 文本仍受采样波动；
+  - 两者结合 → 文本与数值双重一致，尤其适用于嵌入后处理、向量检索等场景。
+
+## 测试与基准
 
 ```bash
 pip install -e .[dev]
-pytest
+pytest tests -q --override-ini addopts=''        # 单元测试
+python benchmarks/determinism_benchmark.py        # 数值 + 性能表格
+python benchmarks/seed_sensitivity.py             # 随机种子敏感性分析
 ```
 
-测试用例会自动选择 `mps` 或 `cpu` 设备，验证劫持后的算子在批次变化情况下依然给出完全一致的结果。
+更多脚本与说明见 `benchmarks/` 与 `docs/` 目录。
 
-## 限制与后续工作
+## 设计与限制
 
-- 目前实现将所有运算迁移到 CPU 上，性能低于 GPU/MPS 原生算子，更适合强调确定性的场景。
-- 仅覆盖 `mm`/`addmm`/`log_softmax`/`mean`，可按需扩展更多算子。
-- 若未来 Triton 或 PyTorch 在 Apple GPU 上提供可控的线程调度接口，可将本项目替换为真正的 GPU 持久化 kernel 实现。
+- 目前仅覆盖推理常用的 `mm`、`addmm`、`log_softmax`、`mean`。
+- 主要面向推理/分析工作负载；若用于训练，请评估 CPU 回落的性能成本。
+- MPS 暂不支持 `float64`，框架会自动回退到 CPU；如需更高性能，可选 `precision=torch.float32` 并在关键步骤使用批次不变模式。
+- 批次不变算子解决的是**数值层面的非确定性**；要得到完全一致的文本输出，仍需结合确定性采样策略。
 
-## 致谢
+## 引用与致谢
 
-- [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) 原作者提供的方法论基础。
+- [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+- PyTorch `torch.library` 的设计，使得算子级重载成为可能。
+
+如在研究或产品中使用本项目，欢迎引用“Batch Invariant Ops (Apple Silicon Edition)”。
